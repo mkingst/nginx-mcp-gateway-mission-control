@@ -56,8 +56,8 @@ The direct MCP endpoint is bound to localhost and is intended only for demonstra
 Clone the repository:
 
 ```bash
-git clone https://github.com/YOUR-USERNAME/nginx-mcp-mission-control.git
-cd nginx-mcp-mission-control
+git clone https://github.com/mkingst/nginx-mcp-gateway-mission-control.git
+cd nginx-mcp-gateway-mission-control
 ```
 
 Create your local environment file:
@@ -66,7 +66,7 @@ Create your local environment file:
 cp .env.example .env
 ```
 
-Edit `.env` and set an `NGINX_EDITOR_TOKEN` password of at least five characters.
+Edit `.env` and set a unique `NGINX_EDITOR_TOKEN` password of at least five characters. The placeholder value from `.env.example` is rejected and leaves the editor disabled.
 
 Start everything:
 
@@ -83,6 +83,10 @@ Open the demo:
 | Direct MCP server | http://localhost:8001/mcp |
 | Grafana | http://localhost:3002 |
 | Prometheus | http://localhost:9090 |
+
+All ports are published on `127.0.0.1` only, so the demo is not reachable from other machines on the same network (for example conference Wi-Fi). To expose it deliberately, set `DEMO_BIND=0.0.0.0` in `.env`.
+
+If a port is already in use ("port is already allocated"), override it in `.env` with `GATEWAY_PORT`, `UI_PORT`, `MCP_DIRECT_PORT`, `GRAFANA_PORT` or `PROMETHEUS_PORT`, and use that port instead of the default in the URLs and curl commands below. `scripts/reset.sh` reads these from `.env`; for `scripts/populate.py`, pass `--url` or export `GATEWAY_PORT`.
 
 All commands below are intended to run on the computer hosting Docker. The multiline curl examples use Bash-compatible syntax (macOS Terminal, Linux shell, Git Bash, or WSL).
 
@@ -133,7 +137,7 @@ curl -i http://localhost:8001/mcp \
 
 Notice that the URL is still `/mcp`. The actual tool name is specified inside the JSON-RPC body.
 
-### 3. Attempt a delete — bypass NGINX
+### 3. Delete a pod — bypass NGINX
 
 ```bash
 curl -i http://localhost:8001/mcp \
@@ -146,22 +150,22 @@ curl -i http://localhost:8001/mcp \
     "params": {
       "name": "delete_pod",
       "arguments": {
-        "name": "demo-nonexistent-pod"
+        "name": "cache-9b1e"
       }
     }
   }'
 ```
 
-This request goes **directly to the MCP server**, without NGINX authorization checks.
+This request goes **directly to the MCP server**, without any authentication or authorization, and the pod is really deleted from the simulated cluster: the response contains `"deleted"`. Run `list_pods` again to confirm it is gone.
 
-The nonexistent pod name prevents deletion of actual demo data. The MCP server may return a not-found tool error.
+The data is simulated and held in memory; `./scripts/reset.sh` restores it.
 
 ### 4. Attempt the same delete — through NGINX
 
 Now send the request to **port 8080**, using a Viewer API key:
 
 ```bash
-curl -i http://localhost:8080/mcp \
+curl -i http://localhost:18080/mcp \
   -H 'Content-Type: application/json' \
   -H 'Accept: application/json, text/event-stream' \
   -H 'X-API-Key: viewer-demo' \
@@ -181,6 +185,8 @@ curl -i http://localhost:8080/mcp \
 **Expected: HTTP 403 Forbidden.**
 
 NGINX identifies the `delete_pod` tool, checks the Viewer role, and blocks the operation before it reaches the MCP server.
+
+RBAC is an **allowlist**: each role is granted specific tools in `nginx/nginx.conf`, and any `tools/call` not granted there — including tools added to the server later — is denied with HTTP 403. Requests whose JSON-RPC method NGINX cannot read (JSON-RPC batch arrays, invalid JSON, non-JSON content types) are rejected with HTTP 400 instead of being proxied unchecked.
 
 ### 5. Call an allowed tool — through NGINX
 
@@ -208,9 +214,9 @@ The demo includes three fictional API keys:
 
 | API key | Role | Example permissions |
 |---|---|---|
-| `viewer-demo` | Viewer | Read-only operations |
-| `operator-demo` | Operator | Read and selected write operations |
-| `admin-demo` | Admin | All demo tools |
+| `viewer-demo` | Viewer | Read-only and utility tools |
+| `operator-demo` | Operator | Viewer tools plus create/update |
+| `admin-demo` | Admin | All demo tools, including delete |
 
 Try changing the `X-API-Key` header in the previous curl commands.
 
@@ -238,7 +244,7 @@ Experiment with:
 
 - Allowed and denied tool calls
 - Different Viewer, Operator, and Admin permissions
-- HTTP 401 and 403 responses
+- HTTP 400, 401 and 403 responses
 - Tool-specific rate limiting
 
 ### Rate limiting
@@ -255,7 +261,9 @@ The default NGINX limits are:
 
 Excessive requests are rejected with HTTP **429 Too Many Requests**.
 
-These limits are applied per client IP, with separate rate-limit zones for each configured tool category.
+These limits are applied per client IP, with separate rate-limit zones for each configured tool. Other tools are not rate-limited in this demo.
+
+Rejected requests carry the response header `X-MCP-Policy: rate-limited`.
 
 ---
 
@@ -269,7 +277,7 @@ For an incoming `tools/call` request, NGINX:
 2. **Reads the JSON body early** using `client_body_early_read`.
 3. **Extracts the MCP method and tool name** using native `json_set` functionality.
 4. **Identifies the caller** from the demo API key.
-5. **Checks RBAC** and rejects unauthorized operations with HTTP 401 or 403.
+5. **Checks RBAC** and rejects unauthenticated (401), unreadable (400) or unauthorized (403) requests.
 6. **Applies tool-specific rate limiting**, returning HTTP 429 when necessary.
 7. **Proxies allowed requests** to the MCP server.
 8. **Observes the response** using njs and OpenTelemetry.
@@ -317,6 +325,8 @@ Click **Validate & Apply**.
 
 The editor validates the configuration with `nginx -t` and requests an NGINX reload. Invalid configurations are rolled back.
 
+Edits only change the running container. `nginx/nginx.conf` in the repository is mounted read-only and is never modified; restarting the `nginx` container (or running `./scripts/reset.sh`) discards live edits.
+
 Run the 25-request burst again to see the effect of the new allowance.
 
 **No changes to the MCP server are required.**
@@ -333,6 +343,26 @@ This helps visualize gateway traffic, policy rejections, rate limiting, and MCP-
 
 An MCP tool can report `isError: true` even when HTTP returns `200 OK`. The njs observer helps surface those tool-level failures.
 
+Grafana opens directly on the **NGINX MCP Observability** dashboard. To fill it with realistic traffic (allowed, blocked, unauthenticated, rate-limited, tool errors and JSON-RPC errors across all three roles):
+
+```bash
+python3 scripts/populate.py
+```
+
+Wait 10–20 seconds for the collector flush and Prometheus scrape, then refresh Grafana.
+
+Each request is labelled with an `mcp.policy` of `allowed`, `blocked`, `unauthenticated`, `malformed` or `rate_limited`. The `mcp.outcome` label (`complete`, `tool_error`, `rpc_error`, …) is only set for `tools/call` requests that NGINX actually proxied.
+
+---
+
+## Resetting before a demo
+
+```bash
+./scripts/reset.sh
+```
+
+This restarts the stack without rebuilding: deleted pods and records come back, live NGINX edits are discarded, and rate-limit counters and Prometheus history are cleared.
+
 ---
 
 ## Demo notes
@@ -343,6 +373,7 @@ An MCP tool can report `isError: true` even when HTTP returns `200 OK`. The njs 
 - The live configuration editor is intended for trusted local demonstrations.
 - The **Further Architectures** tab contains illustrative examples, not additional deployed gateway functionality.
 - The stack is a demonstration, not a production-hardened security solution.
+- `njs/mcp-observer.mjs` is from the upstream nginx-mcp-js project (F5, Inc.) and is covered by `UPSTREAM-LICENSE` (Apache 2.0).
 
 ---
 

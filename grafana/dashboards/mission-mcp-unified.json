@@ -441,7 +441,7 @@
     },
     {
       "type": "timeseries",
-      "title": "Allowed vs blocked \u2014 last 15m",
+      "title": "Gateway decisions (allowed / blocked / rate_limited / unauthenticated / malformed) \u2014 last 15m",
       "targets": [
         {
           "refId": "A",

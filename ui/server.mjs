@@ -3,6 +3,8 @@ import {readFile,writeFile,access} from 'node:fs/promises';
 import {timingSafeEqual} from 'node:crypto';
 import {Client} from '@modelcontextprotocol/sdk/client/index.js';
 import {StreamableHTTPClientTransport} from '@modelcontextprotocol/sdk/client/streamableHttp.js';
+// The placeholder from .env.example must never unlock the editor.
+const WEAK_TOKENS=new Set(['change-this-demo-password']);
 const endpoints={direct:process.env.DIRECT_MCP_URL,gateway:process.env.MCP_URL};
 const events=[];
 function log(e){events.unshift({at:new Date().toISOString(),...e});events.splice(100);}
@@ -24,7 +26,7 @@ async function execute({mode,agent,apiKey,action,tool,args,count}){
      method:'POST',
      headers:{'Content-Type':'application/json','Accept':'application/json, text/event-stream',
       'X-Demo-Agent':agent,...(mode==='gateway'&&apiKey?{'X-API-Key':apiKey}:{})},
-     body:JSON.stringify({jsonrpc:'2.0',id:i+1,method:'tools/call',params:{name:burstTool,arguments:burstTool==='list_pods'?{}:{}}}),
+     body:JSON.stringify({jsonrpc:'2.0',id:i+1,method:'tools/call',params:{name:burstTool,arguments:{}}}),
      signal:AbortSignal.timeout(10000)
     });
     // Consume the response so connection resources are released.
@@ -56,14 +58,15 @@ const server=http.createServer(async(req,res)=>{
  const send=(status,data)=>{res.writeHead(status,{'content-type':'application/json','cache-control':'no-store'});res.end(JSON.stringify(data));};
  if(req.url==='/api/nginx-config'&&req.method==='GET'){
   try{
-   const config=await readFile('/demo/nginx.conf','utf8');
+   // Live config as currently loaded by NGINX (written by editor-supervisor.sh).
+   const config=await readFile('/demo-control/live.conf','utf8');
    res.writeHead(200,{'content-type':'application/json','cache-control':'no-store'});
    return res.end(JSON.stringify({file:'nginx/nginx.conf',config}));
   }catch(e){return send(503,{error:'NGINX configuration is unavailable: '+errorText(e)});}
  }
  if(req.url==='/api/nginx-editor'&&req.method==='POST'){
   const secret=process.env.NGINX_EDITOR_TOKEN||'';
-  if(secret.length<5)return send(503,{error:'Editor disabled. Set NGINX_EDITOR_TOKEN (5+ characters) in .env and recreate ui.'});
+  if(secret.length<5||WEAK_TOKENS.has(secret))return send(503,{error:'Editor disabled. Set a unique NGINX_EDITOR_TOKEN (5+ characters, not the .env.example value) in .env and recreate ui.'});
   const received=String(req.headers['x-editor-token']||'');
   const a=Buffer.from(secret),b=Buffer.from(received);
   if(a.length!==b.length||!timingSafeEqual(a,b))return send(403,{error:'Incorrect editor password'});
@@ -94,7 +97,8 @@ const server=http.createServer(async(req,res)=>{
  if(req.url==='/api/events')return send(200,events);
  if(req.url==='/api/health'){
   let gateway=false;try{gateway=(await fetch(process.env.GATEWAY_HEALTH_URL,{signal:AbortSignal.timeout(2000)})).ok;}catch{}
-  return send(200,{gateway,directEndpoint:endpoints.direct,gatewayEndpoint:endpoints.gateway});
+  return send(200,{gateway,directEndpoint:endpoints.direct,gatewayEndpoint:endpoints.gateway,
+   grafanaPort:process.env.GRAFANA_PORT||'3002',prometheusPort:process.env.PROMETHEUS_PORT||'9090'});
  }
  if(req.url==='/api/run'&&req.method==='POST'){
   let raw='';for await(const part of req){raw+=part;if(raw.length>20000)return send(413,{error:'Payload too large'});}
